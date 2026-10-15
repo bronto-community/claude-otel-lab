@@ -3,6 +3,7 @@
 The Claude SDK's tool runner wraps each call in an `anthropic.custom_tool_use`
 span. Spans and logs created inside a tool nest under that span automatically.
 """
+import contextvars
 import json
 import logging
 import os
@@ -19,8 +20,13 @@ tracer = trace.get_tracer("oncall.tools")
 log = logging.getLogger("oncall.tools")
 
 
+# Chaos mode makes the metrics tool time out. Turn it on for one alert
+# (`fire_alert --chaos`) or for every alert (LAB_CHAOS=1).
+chaos_requested: contextvars.ContextVar[bool] = contextvars.ContextVar("chaos_requested", default=False)
+
+
 def chaos() -> bool:
-    return os.environ.get("LAB_CHAOS", "") == "1"
+    return chaos_requested.get() or os.environ.get("LAB_CHAOS", "") == "1"
 
 
 @beta_tool

@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: make test PYTHON=python
+      - name: Copilot starts and answers /healthz
+        env:
+          ANTHROPIC_API_KEY: sk-ant-ci
+        run: |
+          .venv/bin/uvicorn oncall.app:app --port 8000 &
+          for i in $(seq 1 30); do curl -sf localhost:8000/healthz && exit 0; sleep 1; done; exit 1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sed "s/^ANTHROPIC_API_KEY=.*/ANTHROPIC_API_KEY=sk-ant-ci/" .env.example > .env
+      - run: docker compose config --quiet
+      - run: docker compose up -d --build --wait copilot
+      - run: curl -sf localhost:8000/healthz
+      - if: always()
+        run: docker compose logs copilot && docker compose down

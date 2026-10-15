@@ -1,5 +1,7 @@
 # On-call Copilot: a Claude Platform + OpenTelemetry lab
 
+[![CI](https://github.com/bronto-community/claude-otel-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/bronto-community/claude-otel-lab/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A small but realistic app for exploring the Claude Platform's [OpenTelemetry export](https://platform.claude.com/docs/en/manage-claude/opentelemetry). It works with any OTLP backend and has one-variable setup for [Bronto](https://bronto.io).
 
 An alert fires. The **On-call Copilot**, a FastAPI service, triages it with Claude and four tools over a (fake) production world: deploys, logs, latency and runbooks. It can then hand the incident to a **Claude Managed Agent** that analyses the latency data in a sandbox and writes the postmortem.
@@ -30,6 +32,8 @@ fire_alert                                        alertmanager-sim
       └─ …
 ```
 
+![The trace of one alert in Bronto: 59 spans across three services](docs/trace-waterfall.png)
+
 ## How the telemetry flows
 
 There are two independent span sources, and the lab uses both:
@@ -45,15 +49,30 @@ The SDK sends a W3C `traceparent` header with each request, and the API attaches
 
 ## Quickstart
 
-You need Python 3.10+, a Claude API key, and an OTLP backend. The Bronto free tier works; for any other backend, see [Use any OTLP backend](#use-any-otlp-backend).
+You need:
+- a [Claude API key](https://platform.claude.com/settings/keys)
+- somewhere to send traces: a [Bronto](https://bronto.io) account (there's a 14-day free trial), any other OTLP backend, or nothing, in which case spans are printed to the console
+- Python 3.10+ (or Docker, see [below](#run-with-docker))
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env    # add ANTHROPIC_API_KEY and BRONTO_API_KEY
+git clone https://github.com/bronto-community/claude-otel-lab && cd claude-otel-lab
+make setup        # creates .venv and .env; then put your keys in .env
+make demo         # starts the copilot, fires one alert, prints the trace ID
 ```
 
-**1. Send API spans to your backend.** In the Claude Console, open [Settings → OpenTelemetry](https://platform.claude.com/settings/telemetry-destinations) → **Add destination**:
+| Command | What it does | Cost |
+| --- | --- | --- |
+| `make demo` | One alert: Claude triages it with four tools | A few cents |
+| `make chaos` | Same, but the metrics backend times out | A few cents |
+| `make postmortem` | Triage, then a Managed Agent writes the postmortem to `postmortems/` | About $0.25, hard cap $0.50 |
+| `make server` + `make alert` | Run the copilot and fire alerts yourself | |
+| `make test` | Offline tests, no API key needed | Free |
+
+`make demo` only sends **SDK spans** (your side). To also get the **API spans** (model runs, server tools, agent turns), add a destination in the Claude Console once.
+
+### Send API spans to your backend
+
+In the Claude Console, open [Settings → OpenTelemetry](https://platform.claude.com/settings/telemetry-destinations) → **Add destination**. You need the org admin role.
 
 | Field | Bronto | Any other backend |
 | --- | --- | --- |
@@ -62,23 +81,25 @@ cp .env.example .env    # add ANTHROPIC_API_KEY and BRONTO_API_KEY
 | Request headers | `x-bronto-api-key` = your key | Its auth header |
 | Content mode | Full content (to see prompts and responses) | |
 
-Click **Test** in the destination's menu and check that an `anthropic.test` span arrives. If you have an Admin API key, `scripts/add_destination.sh` does the same from the command line.
+Click **Test** in the destination's menu and check that an `anthropic.test` span arrives. With an Admin API key, `scripts/add_destination.sh` does the same from the command line.
 
-**2. Run the copilot and fire an alert.**
+### Find the trace
+
+Every run prints a `trace_id`. In Bronto, open **Tracing**, paste the ID into the **Trace ID** box, and you'll get the whole waterfall. Use the **Error** toggle to jump to failed spans. If your Bronto API key can read data, `python scripts/bronto_trace.py --trace <trace_id>` prints the trace as a tree in the terminal.
+
+### Run with Docker
 
 ```bash
-uvicorn oncall.app:app --port 8000          # terminal 1
-python -m oncall.fire_alert                 # terminal 2: triage only, ~$0.05
-python -m oncall.fire_alert --postmortem    # + Managed Agents postmortem, ~$0.25, capped at $0.50
+cp .env.example .env                        # add your keys
+docker compose up -d copilot
+docker compose run --rm alert               # or: --postmortem, --chaos
 ```
-
-`fire_alert` prints the `trace_id`. Open that trace in your backend. With Bronto, open Explore Traces and filter by `service.name`, or run `python scripts/bronto_trace.py --trace <trace_id>`.
 
 ## Things to try
 
 | Experiment | How | What to look for |
 | --- | --- | --- |
-| **A failing tool** | Restart the server with `LAB_CHAOS=1` | `get_latency` and `metrics.query` are `ERROR`. Claude retries, then its answer says what it couldn't verify. The trace shows why the answer is hedged. |
+| **A failing tool** | `make chaos`, or `fire_alert --chaos` (`LAB_CHAOS=1` turns it on for every alert) | `get_latency` and `metrics.query` are `ERROR`. Claude retries, then its answer says what it couldn't verify. The trace shows why the answer is hedged. |
 | **Prompts and responses** | Toggle `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE` and the destination's content mode | `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, tool arguments and results |
 | **One conversation** | Every triage uses the alert ID as `conversation_id` | Group by `gen_ai.conversation.id` to see all requests of one triage |
 | **A whole agent session** | Run with `--postmortem` | Group by `anthropic.session.id`. Each `anthropic.session.turn` has `stop_reason` (`requires_action` when it waits for your tool), and sandbox tool spans show the commands the agent ran. |
@@ -90,6 +111,8 @@ python -m oncall.fire_alert --postmortem    # + Managed Agents postmortem, ~$0.2
 ### A bug that tracing found
 
 The first version of `postmortem.py` mounted the CSV at `mount_path="/mnt/data/latency.csv"` and told the agent to read it from there. The postmortem still came out fine, but the trace told a different story. The first `anthropic.tool_use bash` span was `ERROR` (`No such file or directory`), and the next one was a 12-second `find /` looking for the file. Managed Agents roots `mount_path` under `/mnt/session/uploads/`. Without the trace, that wasted time and those wasted tokens would have gone unnoticed.
+
+![Bronto's Error filter narrows the trace to the failed bash call and shows its output](docs/span-error.png)
 
 ## Use any OTLP backend
 
@@ -108,7 +131,7 @@ The API spans need the Console destination, which has stricter requirements than
 
 Defaults: `claude-opus-5-5` at `effort: low`. A triage is about 5k input and 0.8k output tokens across three requests. Each postmortem session has a hard budget (`LAB_SESSION_BUDGET_CENTS`, default 50 cents), and the session pauses when it reaches it.
 
-The agent and environment are created once and stored in `.lab-state.json`; delete the file to recreate them. Sessions are archived after each run.
+The agent and environment are created once and stored in `.lab-state.json`; delete the file to recreate them. Sessions are archived after each run. `make clean` removes the virtualenv and local state.
 
 ## Layout
 
@@ -122,8 +145,14 @@ oncall/
   postmortem.py   Managed Agents session: file upload, sandbox, custom tool, budget
   ops_data.py     The fake production world
 scripts/
+  demo.sh              Start the copilot, fire one alert, stop
   add_destination.sh   Create a Console destination with the Admin API
   bronto_trace.py      Print a trace from Bronto as a tree
+tests/                 Offline tests (make test)
 ```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
 
 Pinned to `anthropic==1.14.0` and `opentelemetry-sdk==1.45.1`. Claude's OpenTelemetry support is in beta, and span names and attributes can change between SDK versions.

@@ -1,0 +1,29 @@
+# docker compose up -d copilot
+# docker compose run --rm alert              # triage only
+# docker compose run --rm alert --postmortem # + Managed Agents postmortem
+# docker compose run --rm alert --chaos      # metrics backend times out
+services:
+  copilot:
+    build: .
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes:
+      - ./postmortems:/lab/postmortems
+      - ./state:/lab/state
+    environment:
+      LAB_STATE_FILE: /lab/state/lab-state.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      retries: 15
+
+  alert:
+    build: .
+    env_file: .env
+    environment:
+      COPILOT_URL: http://copilot:8000
+    entrypoint: ["python", "-m", "oncall.fire_alert"]
+    depends_on:
+      copilot:
+        condition: service_healthy
+    profiles: [tools]
